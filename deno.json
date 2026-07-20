@@ -1,0 +1,18 @@
+{
+  "name": "@nullstyle/launch-agents",
+  "exports": "./mod.ts",
+  "tasks": {
+    "check": "deno check mod.ts tests/*.ts",
+    "coverage": "deno test --allow-read=tests --allow-write=tests --coverage=coverage && deno coverage coverage",
+    "fmt": "deno fmt",
+    "fmt:check": "deno fmt --check",
+    "lint": "deno lint",
+    "test": "deno test --allow-read=tests --allow-write=tests"
+  },
+  "exclude": ["coverage", "tests/.tmp"],
+  "fmt": {
+    "lineWidth": 100,
+    "semiColons": true,
+    "singleQuote": false
+  }
+}
