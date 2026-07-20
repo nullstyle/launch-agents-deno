@@ -1,6 +1,8 @@
 {
   "name": "@nullstyle/launch-agents",
   "exports": "./mod.ts",
+  "version": "0.1.0",
+  "license": "MIT",
   "tasks": {
     "check": "deno check --doc mod.ts src/*.ts tests/*.ts && deno check --doc-only README.md",
     "coverage": "deno test --allow-read=tests --allow-write=tests --coverage=coverage && deno coverage coverage",
