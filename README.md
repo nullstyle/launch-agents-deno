@@ -180,8 +180,9 @@ See [DESIGN.md](./DESIGN.md) for scope and architectural decisions.
 ```sh
 deno task fmt:check # or `deno task fmt` to format
 deno task lint
-deno task check
+deno task check # type-checks code plus every JSDoc and README example
 deno task test
+deno task test:doc # runs the JSDoc examples as tests
 deno task coverage
 ```
 

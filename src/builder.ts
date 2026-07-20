@@ -1,17 +1,49 @@
 /**
- * A fluent, immutable builder for LaunchAgent definitions.
+ * A fluent, immutable builder for LaunchAgent definitions — and a guided tour
+ * of what launchd can do for a per-user job.
  *
- * State model, stated once: field-named methods replace the whole field;
- * `add*` methods accumulate; the scheduling and logging shorthands (`every`,
- * `daily`, `weekly`, `logsTo`) desugar onto those same fields. Every method
- * returns a new frozen builder, so a partial builder is a reusable template.
+ * A LaunchAgent is a per-user program managed by launchd, defined by a plist
+ * in `~/Library/LaunchAgents` and loaded into the user's `gui/<uid>` domain at
+ * login. launchd replaces cron jobs, login items, and hand-rolled daemons with
+ * one declarative model:
  *
- * The builder performs no validation of its own: `build()` assembles a plain
- * definition object and delegates every rule to `validateLaunchAgent`, the
- * package's single source of validation truth. A phantom type parameter makes
- * `build()` a compile error until `program()` or `programArguments()` has been
- * provided; the validator remains the runtime authority when that compile-time
- * gate is defeated with a cast.
+ * - **Launch triggers** — start on load ({@linkcode LaunchAgentBuilder.runAtLoad}),
+ *   on a calendar schedule ({@linkcode LaunchAgentBuilder.startCalendarInterval},
+ *   {@linkcode LaunchAgentBuilder.daily}, {@linkcode LaunchAgentBuilder.weekly}),
+ *   every N seconds ({@linkcode LaunchAgentBuilder.startInterval}), when watched
+ *   paths change ({@linkcode LaunchAgentBuilder.watchPaths}), while a work-queue
+ *   directory is non-empty ({@linkcode LaunchAgentBuilder.queueDirectories}),
+ *   when a filesystem mounts ({@linkcode LaunchAgentBuilder.startOnMount}), or
+ *   on demand when a client messages a registered Mach service
+ *   ({@linkcode LaunchAgentBuilder.machServices}) — Apple's preferred trigger.
+ * - **Lifecycle** — keep the job alive unconditionally or by condition
+ *   ({@linkcode LaunchAgentBuilder.keepAlive}), space out respawns
+ *   ({@linkcode LaunchAgentBuilder.throttleInterval}), bound graceful shutdown
+ *   ({@linkcode LaunchAgentBuilder.exitTimeOut}), or make idle exit safe with
+ *   XPC transactions ({@linkcode LaunchAgentBuilder.enableTransactions},
+ *   {@linkcode LaunchAgentBuilder.enablePressuredExit}).
+ * - **Execution environment** — argv with no shell in the picture
+ *   ({@linkcode LaunchAgentBuilder.programArguments}), working directory,
+ *   environment variables, umask, and stdio redirection to files
+ *   ({@linkcode LaunchAgentBuilder.logsTo}).
+ * - **Resource policy** — coarse classification the system throttles by
+ *   ({@linkcode LaunchAgentBuilder.processType}), plus fine-grained nice,
+ *   rlimits, and low-priority I/O knobs.
+ *
+ * launchd expects agents to cooperate: never daemonize (no `fork` + parent
+ * exit), handle SIGTERM by winding down quickly, and prefer on-demand launches
+ * over always-running processes.
+ *
+ * Builder contract, stated once: field-named methods replace the whole field;
+ * `add*` methods accumulate; the shorthands (`every`, `daily`, `weekly`,
+ * `logsTo`) desugar onto those same fields. Every method returns a new frozen
+ * builder, so a partial builder is a reusable template. The builder performs
+ * no validation of its own: `build()` assembles a plain definition object and
+ * delegates every rule to `validateLaunchAgent`, the package's single source
+ * of validation truth. A phantom type parameter makes `build()` a compile
+ * error until `program()` or `programArguments()` has been provided; the
+ * validator remains the runtime authority when that compile-time gate is
+ * defeated with a cast.
  */
 import { validateLaunchAgent } from "./plist.ts";
 import type {
@@ -59,7 +91,19 @@ export class LaunchAgentBuilder<
     construct = (draft) => new LaunchAgentBuilder(draft);
   }
 
-  /** Seed a builder from an existing definition; validation waits for build(). */
+  /**
+   * Seed a builder from an existing definition; validation waits for build().
+   *
+   * @example Adjust an existing definition
+   * ```ts
+   * import { assertEquals } from "@std/assert";
+   *
+   * const existing = { label: "dev.example.worker", program: "/usr/local/bin/worker" };
+   * const tuned = LaunchAgentBuilder.from(existing).keepAlive({ crashed: true }).build();
+   * assertEquals(tuned.keepAlive, { crashed: true });
+   * assertEquals(tuned.label, "dev.example.worker");
+   * ```
+   */
   static from(config: LaunchAgentConfig): LaunchAgentBuilder<"has-program"> {
     return new LaunchAgentBuilder({ ...config }) as LaunchAgentBuilder<"has-program">;
   }
@@ -68,17 +112,44 @@ export class LaunchAgentBuilder<
     return new LaunchAgentBuilder({ ...this.#draft, ...patch }) as LaunchAgentBuilder<T>;
   }
 
-  /** Derive a builder identical except for its label; the template affordance. */
+  /**
+   * Derive a builder identical except for its label — the template
+   * affordance. The label is the job's unique identity within its launchd
+   * domain and, by convention, the plist filename (`<label>.plist`); use a
+   * stable reverse-DNS name such as `dev.example.indexer`.
+   *
+   * @example Specialize one shared template per agent
+   * ```ts
+   * import { assertEquals } from "@std/assert";
+   *
+   * const nightly = launchAgent("dev.example.nightly").daily(2, 30).processType("Background");
+   * const photos = nightly.relabel("dev.example.photos").program("/usr/local/bin/backup-photos");
+   * const music = nightly.relabel("dev.example.music").program("/usr/local/bin/backup-music");
+   * assertEquals(photos.build().label, "dev.example.photos");
+   * assertEquals(music.build().startCalendarInterval, { hour: 2, minute: 30 });
+   * ```
+   */
   relabel(label: string): LaunchAgentBuilder<S> {
     return this.#derive<S>({ label });
   }
 
-  /** Set the absolute executable path. Unlocks build(). */
+  /**
+   * Set the absolute path of the executable launchd hands to execv(3). No
+   * shell is ever involved. When `programArguments` is also set, this names
+   * the binary while the argument array supplies the full argv (argv[0]
+   * included). Unlocks build().
+   */
   program(path: string): LaunchAgentBuilder<"has-program"> {
     return this.#derive<"has-program">({ program: path });
   }
 
-  /** Replace the complete argv, argv[0] included. Unlocks build(). */
+  /**
+   * Replace the complete argv, argv[0] included, passed to the job with
+   * execvp(3) semantics. launchd expands nothing: `~`, `$VARIABLES`, globs,
+   * pipes, and redirections are all passed through as literal text. When
+   * `program` is absent, argv[0] names the binary (a relative value resolves
+   * against the standard system path, not the user's PATH). Unlocks build().
+   */
   programArguments(argv: NonEmptyArray<string>): LaunchAgentBuilder<"has-program"> {
     return this.#derive<"has-program">({
       programArguments: Object.freeze([...argv]) as NonEmptyArray<string>,
@@ -89,6 +160,24 @@ export class LaunchAgentBuilder<
    * Append program arguments in call order. When only `program()` was called,
    * the argv is first initialized to `[program]`, mirroring launchd's implicit
    * argv — so a later `program()` change leaves a stale argv[0] behind.
+   *
+   * @example Accumulate argv across calls
+   * ```ts
+   * import { assertEquals } from "@std/assert";
+   *
+   * const agent = launchAgent("dev.example.sync")
+   *   .program("/usr/bin/rsync")
+   *   .addArguments("-a", "--delete")
+   *   .addArguments("/Users/me/Documents/", "/Volumes/Backup/")
+   *   .build();
+   * assertEquals(agent.programArguments, [
+   *   "/usr/bin/rsync", // initialized from program()
+   *   "-a",
+   *   "--delete",
+   *   "/Users/me/Documents/",
+   *   "/Volumes/Backup/",
+   * ]);
+   * ```
    */
   addArguments(
     this: LaunchAgentBuilder<"has-program">,
@@ -101,31 +190,57 @@ export class LaunchAgentBuilder<
     });
   }
 
-  /** Launch once when the definition is loaded. */
+  /**
+   * Launch the job once at the moment it is loaded into the domain — for a
+   * LaunchAgent, at login. Defaults to false. Apple discourages it: every
+   * speculative launch slows boot and login, and most jobs can wait for a
+   * demand trigger (Mach service, schedule, or watched path) instead.
+   */
   runAtLoad(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ runAtLoad: value });
   }
 
-  /** Replace the keep-alive policy; conditions are never merged across calls. */
+  /**
+   * Control whether launchd keeps the job running rather than launching it
+   * purely on demand. `true` restarts the job whenever it exits — a
+   * permanent service. A conditions dictionary restarts it selectively,
+   * with the conditions ORed together: `successfulExit` (restart while
+   * exits are clean, or unclean when false), `crashed` (restart after
+   * crash signals such as SIGSEGV), `pathState` (alive while filesystem
+   * paths exist, or while absent), and `otherJobEnabled` (alive while
+   * another label is loaded — discouraged; coordinate over IPC instead).
+   * Any keep-alive implies `runAtLoad`, and jobs that exit quickly and
+   * repeatedly are throttled per `throttleInterval`. Conditions are never
+   * merged across calls; the whole policy is replaced.
+   */
   keepAlive(value: boolean | KeepAliveConditions = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({
       keepAlive: typeof value === "boolean" ? value : Object.freeze({ ...value }),
     });
   }
 
-  /** Mark the job disabled by default. */
+  /**
+   * Hint that the job should not be loaded by default. The persistent
+   * `launchctl enable`/`disable` state overrides this key and lives outside
+   * the plist, so a disabled label stays disabled across rewrites of the
+   * file (and across reboots) until explicitly re-enabled.
+   */
   disabled(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ disabled: value });
   }
 
-  /** Set the absolute working directory. */
+  /** Absolute directory launchd chdir(2)s to before running the job. */
   workingDirectory(path: string): LaunchAgentBuilder<S> {
     return this.#derive<S>({ workingDirectory: path });
   }
 
   /**
-   * Replace the whole environment dictionary; use addEnvironment() to merge.
-   * Rendered plists are world-readable — do not put secrets here.
+   * Replace the extra environment variables set before the job runs; use
+   * addEnvironment() to merge instead. A launchd job does not inherit a
+   * login shell's environment — no shell rc files, no user PATH — so
+   * anything the program needs must be declared here or read by the job
+   * itself. Rendered plists are world-readable; never put secrets in the
+   * environment.
    */
   environment(variables: Readonly<Record<string, string>>): LaunchAgentBuilder<S> {
     return this.#derive<S>({ environment: Object.freeze({ ...variables }) });
@@ -146,17 +261,29 @@ export class LaunchAgentBuilder<
     });
   }
 
-  /** Set the absolute path connected to standard input. */
+  /**
+   * Absolute file mapped to the job's stdin. If the file does not exist the
+   * job simply receives no input.
+   */
   standardInPath(path: string): LaunchAgentBuilder<S> {
     return this.#derive<S>({ standardInPath: path });
   }
 
-  /** Set the absolute path receiving standard output. */
+  /**
+   * Absolute file that receives the job's stdout. launchd creates the
+   * file if missing (with permissions honoring the umask key, when set);
+   * in practice output accumulates forever and launchd never rotates it,
+   * so long-running agents should manage their own log growth.
+   */
   standardOutPath(path: string): LaunchAgentBuilder<S> {
     return this.#derive<S>({ standardOutPath: path });
   }
 
-  /** Set the absolute path receiving standard error. */
+  /**
+   * Absolute file that receives the job's stderr. Same creation and
+   * accumulation behavior as standardOutPath(). Without it, stderr is
+   * discarded — set one before debugging a misbehaving agent.
+   */
   standardErrorPath(path: string): LaunchAgentBuilder<S> {
     return this.#derive<S>({ standardErrorPath: path });
   }
@@ -173,7 +300,14 @@ export class LaunchAgentBuilder<
     });
   }
 
-  /** Replace the whole watch-path list; use addWatchPaths() to append. */
+  /**
+   * Replace the list of absolute paths whose modification starts the job;
+   * use addWatchPaths() to append. Apple warns that filesystem monitoring
+   * is race-prone and lossy: changes can be missed, and the file may
+   * still be mid-write when the job launches. launchd also does not tell
+   * the job which path fired — it must inspect the world itself. Prefer
+   * demand-based IPC where possible.
+   */
   watchPaths(paths: readonly string[]): LaunchAgentBuilder<S> {
     return this.#derive<S>({ watchPaths: Object.freeze([...paths]) });
   }
@@ -185,7 +319,13 @@ export class LaunchAgentBuilder<
     });
   }
 
-  /** Replace the whole queue-directory list; use addQueueDirectories() to append. */
+  /**
+   * Replace the list of directories that act as filesystem work queues;
+   * use addQueueDirectories() to append. launchd keeps the job alive as
+   * long as any listed directory is non-empty — the classic drop-folder
+   * pattern: the job drains files as they appear and exits once every
+   * queue is empty.
+   */
   queueDirectories(directories: readonly string[]): LaunchAgentBuilder<S> {
     return this.#derive<S>({ queueDirectories: Object.freeze([...directories]) });
   }
@@ -197,12 +337,23 @@ export class LaunchAgentBuilder<
     });
   }
 
-  /** Start the job when a filesystem is mounted. */
+  /**
+   * Start the job every time a filesystem is mounted — external drives,
+   * disk images, network shares. There is no per-volume filter; the job
+   * decides for itself whether the new mount is interesting.
+   */
   startOnMount(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ startOnMount: value });
   }
 
-  /** Start the job every this many seconds. */
+  /**
+   * Start the job every N seconds. Two caveats distinguish this from a
+   * wall-clock schedule: a firing that occurs while the Mac sleeps is
+   * missed entirely (not queued for wake), and a firing that occurs while
+   * the previous run is still executing is skipped. For calendar-time jobs
+   * that should catch up after sleep, use startCalendarInterval() instead;
+   * the two trigger types are evaluated independently.
+   */
   startInterval(seconds: number): LaunchAgentBuilder<S> {
     return this.#derive<S>({ startInterval: seconds });
   }
@@ -213,9 +364,13 @@ export class LaunchAgentBuilder<
   }
 
   /**
-   * Replace the calendar rule(s); use addCalendarIntervals(), daily(), or
-   * weekly() to append. An omitted field is a launchd wildcard — in
-   * particular, an omitted minute fires once per minute for the whole hour.
+   * Replace the cron-like calendar rule(s); use addCalendarIntervals(),
+   * daily(), or weekly() to append. Every omitted field is a wildcard — an
+   * omitted minute fires sixty times across the matching hour. When both
+   * day and weekday are set, the rule fires when EITHER matches, exactly
+   * as in crontab. Unlike cron, launchd catches up after sleep: intervals
+   * that pass while the machine sleeps fire once on wake, with multiple
+   * missed intervals coalesced into a single launch.
    */
   startCalendarInterval(
     value: CalendarInterval | readonly CalendarInterval[],
@@ -248,6 +403,22 @@ export class LaunchAgentBuilder<
    * Append one daily rule at the given hour. The minute defaults to 0
    * explicitly, because an omitted minute is a launchd wildcard that fires
    * sixty times in the hour.
+   *
+   * @example daily() and weekly() append calendar rules
+   * ```ts
+   * import { assertEquals } from "@std/assert";
+   *
+   * const digest = launchAgent("dev.example.digest")
+   *   .program("/usr/local/bin/digest")
+   *   .daily(7)
+   *   .weekly([1, 5], 9, 30)
+   *   .build();
+   * assertEquals(digest.startCalendarInterval, [
+   *   { hour: 7, minute: 0 },
+   *   { weekday: 1, hour: 9, minute: 30 },
+   *   { weekday: 5, hour: 9, minute: 30 },
+   * ]);
+   * ```
    */
   daily(hour: number, minute = 0): LaunchAgentBuilder<S> {
     return this.#appendCalendar([{ hour, minute }]);
@@ -266,95 +437,171 @@ export class LaunchAgentBuilder<
     return this.#appendCalendar(weekdays.map((day) => ({ weekday: day, hour, minute })));
   }
 
-  /** Set the resource policy classification. */
+  /**
+   * Tell the system what kind of job this is so it can throttle
+   * appropriately — Apple prefers this over hand-tuning nice() and
+   * rlimits. Left unset, the system applies light resource limits,
+   * throttling CPU and I/O; "Standard" is defined as equivalent to
+   * leaving it unset. "Background" is throttled so the job cannot
+   * disrupt the user experience. "Adaptive" shifts between Background
+   * and Interactive as XPC transaction activity rises and falls.
+   * "Interactive" is app-like and unthrottled — reserve it for jobs the
+   * user is actively waiting on.
+   */
   processType(type: ProcessType): LaunchAgentBuilder<S> {
     return this.#derive<S>({ processType: type });
   }
 
-  /** Set the minimum seconds between launch attempts. */
+  /**
+   * Minimum seconds between launches of this job (default 10). launchd's
+   * philosophy is that jobs should linger for their next request rather
+   * than churn: a job respawning faster than this interval is delayed, and
+   * with keepAlive that manifests as visible restart backoff.
+   */
   throttleInterval(seconds: number): LaunchAgentBuilder<S> {
     return this.#derive<S>({ throttleInterval: seconds });
   }
 
   /**
-   * Set the seconds allowed for graceful termination before SIGKILL.
-   * launchd interprets 0 as infinity and warns against it.
+   * Seconds launchd waits between SIGTERM and SIGKILL when stopping the
+   * job; the default is system-defined. launchd interprets 0 as infinity
+   * and warns against it — an unkillable job can stall system shutdown
+   * forever.
    */
   exitTimeOut(seconds: number): LaunchAgentBuilder<S> {
     return this.#derive<S>({ exitTimeOut: seconds });
   }
 
-  /** Set the process nice value. */
+  /**
+   * nice(3) scheduling priority for the job. Prefer processType(), which
+   * lets the system manage priority holistically.
+   */
   nice(value: number): LaunchAgentBuilder<S> {
     return this.#derive<S>({ nice: value });
   }
 
-  /** Set the file creation mask as a decimal integer or octal string such as "022". */
+  /**
+   * umask(2) applied before the job runs, shaping the permissions of every
+   * file it creates (including launchd-created log files). Plist integers
+   * cannot be written in octal, so the number form is the literal value
+   * (18 == octal 022); the string form is parsed per strtoul(3), where a
+   * leading "0" means octal — "022" is the familiar spelling.
+   */
   umask(mask: number | string): LaunchAgentBuilder<S> {
     return this.#derive<S>({ umask: mask });
   }
 
   /**
-   * Historical flag asking launchd to glob program arguments.
-   * @deprecated launchd has ignored EnableGlobbing since OS X 10.10.
+   * Historical flag asking launchd to glob(3) program arguments.
+   * @deprecated launchd has ignored EnableGlobbing since OS X 10.10;
+   * arguments are always passed literally.
    */
   enableGlobbing(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ enableGlobbing: value });
   }
 
-  /** Let XPC transactions indicate whether the job is active. */
+  /**
+   * Declare that the job tracks its busy state with XPC transactions
+   * (xpc_transaction_begin/end). launchd then knows the difference between
+   * active and idle: stopping an active process sends SIGTERM with a grace
+   * period, while an idle one is killed immediately and safely. This is
+   * the foundation of clean idle-exit behavior for on-demand services.
+   */
   enableTransactions(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ enableTransactions: value });
   }
 
-  /** Allow reclamation under memory pressure when the job is inactive. */
+  /**
+   * Opt into Pressured Exit: when the job is idle (no open XPC
+   * transactions), the system may reclaim it under memory pressure, and it
+   * is relaunched automatically if it exits or crashes while holding open
+   * transactions. Implies enableTransactions. launchd ignores this for
+   * jobs with keepAlive true, and opted-in jobs ignore SIGTERM by default —
+   * handle that signal with a dispatch source.
+   */
   enablePressuredExit(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ enablePressuredExit: value });
   }
 
-  /** Leave processes in the job's process group alive when the job exits. */
+  /**
+   * When a job exits, launchd normally kills every remaining process in
+   * the job's process group — stray children do not outlive the job. Set
+   * true to disable that cleanup, for jobs that intentionally leave
+   * long-lived children behind.
+   */
   abandonProcessGroup(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ abandonProcessGroup: value });
   }
 
-  /** Apply low-priority filesystem I/O policy. */
+  /** Ask the kernel to treat the job's filesystem I/O as low priority. */
   lowPriorityIO(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ lowPriorityIO: value });
   }
 
-  /** Apply low-priority I/O while the process is background-throttled. */
+  /**
+   * Apply low-priority filesystem I/O only while the process is throttled
+   * with the Darwin background classification.
+   */
   lowPriorityBackgroundIO(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ lowPriorityBackgroundIO: value });
   }
 
-  /** Select whether dataless files should be materialized. */
+  /**
+   * Choose whether reading dataless files (cloud-evicted placeholders, as
+   * created by iCloud Drive and similar) triggers their download. True
+   * materializes them; false does not; unset defers to the system policy.
+   * A backup or indexing agent usually wants an explicit decision here.
+   */
   materializeDatalessFiles(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ materializeDatalessFiles: value });
   }
 
-  /** Prevent the job from being launched more than once before reboot. */
+  /**
+   * Declare that the job can run at most once per boot — for programs that
+   * cannot be safely respawned without a full reboot.
+   */
   launchOnlyOnce(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ launchOnlyOnce: value });
   }
 
-  /** Spawn the job into a new security audit session. */
+  /**
+   * Spawn the job into a new security audit session (see auditon(2))
+   * instead of the default session of the context it belongs to.
+   */
   sessionCreate(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ sessionCreate: value });
   }
 
-  /** Request legacy timer behavior; may need processType "Interactive". */
+  /**
+   * Opt the job's timers out of coalescing. Since OS X 10.9 the system
+   * batches timers with similar deadlines to save energy; this requests
+   * precise, uncoalesced firing instead. May have no effect unless
+   * processType is "Interactive".
+   */
   legacyTimers(value = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({ legacyTimers: value });
   }
 
-  /** Replace the session-type restriction, keeping the scalar or array form given. */
+  /**
+   * Restrict which login-session types load the agent, keeping the scalar
+   * or array form given. Modern launchctl documents three: "Aqua", the
+   * ordinary GUI login session and the default for agents; "Background",
+   * per-user contexts that do not require the GUI; and "LoginWindow", the
+   * pre-login login-window context. Two more survive from older releases:
+   * "StandardIO" (non-GUI sessions such as SSH logins) and "System" (the
+   * daemon context, not loadable through this package's per-user domains).
+   */
   sessionTypes(types: SessionType | readonly SessionType[]): LaunchAgentBuilder<S> {
     return this.#derive<S>({
       sessionTypes: typeof types === "string" ? types : Object.freeze([...types]),
     });
   }
 
-  /** Replace the associated bundle identifiers, keeping the scalar or array form given. */
+  /**
+   * Associate the agent with one or more app bundle identifiers so the
+   * System Settings Login Items UI attributes it to the app by name
+   * instead of showing a bare label. Keeps the scalar or array form given.
+   */
   associatedBundleIdentifiers(
     identifiers: string | readonly string[],
   ): LaunchAgentBuilder<S> {
@@ -365,24 +612,42 @@ export class LaunchAgentBuilder<
     });
   }
 
-  /** Replace the whole soft resource-limit dictionary. */
+  /**
+   * Replace the soft setrlimit(2) caps for the job. Byte-count keys:
+   * core, data, fileSize, memoryLock, residentSetSize, and stack. The
+   * rest: cpu is CPU seconds; numberOfFiles and numberOfProcesses (per
+   * UID) are counts. For general throttling prefer processType(); rlimits
+   * are the precision tool.
+   */
   softResourceLimits(limits: ResourceLimits): LaunchAgentBuilder<S> {
     return this.#derive<S>({ softResourceLimits: Object.freeze({ ...limits }) });
   }
 
-  /** Replace the whole hard resource-limit dictionary. */
+  /** Replace the hard setrlimit(2) caps; same keys as softResourceLimits(). */
   hardResourceLimits(limits: ResourceLimits): LaunchAgentBuilder<S> {
     return this.#derive<S>({ hardResourceLimits: Object.freeze({ ...limits }) });
   }
 
-  /** Replace the whole Mach-service record; use addMachService() to merge. */
+  /**
+   * Replace the Mach services registered for the job in the user's
+   * bootstrap namespace; use addMachService() to merge. This is launchd's
+   * on-demand IPC trigger and Apple's preferred way to run a job: the name
+   * is registered immediately, and the first client message to it launches
+   * the job, which must then check in for the service (typically via
+   * xpc_connection_create_mach_service). Per-service options: resetAtClose
+   * destroys and atomically recreates the port with port-death
+   * notifications when the job releases its receive right (incompatible
+   * with XPC); hideUntilCheckIn reserves the name but fails lookups until
+   * the job has checked in (discouraged — it encourages polling).
+   */
   machServices(services: Readonly<Record<string, MachService>>): LaunchAgentBuilder<S> {
     return this.#derive<S>({ machServices: Object.freeze({ ...services }) });
   }
 
   /**
    * Merge one Mach service; a repeated name replaces that entry wholesale.
-   * Omitting the options stores the `true` shorthand.
+   * Omitting the options stores the `true` shorthand — an ordinary
+   * demand-launched service registration.
    */
   addMachService(name: string, service: MachService = true): LaunchAgentBuilder<S> {
     return this.#derive<S>({
@@ -390,7 +655,14 @@ export class LaunchAgentBuilder<
     });
   }
 
-  /** Replace the whole raw-plist escape hatch; use addExtra() to merge. */
+  /**
+   * Replace the raw-plist escape hatch for launchd keys this package does
+   * not model; use addExtra() to merge. The notable residents are Sockets
+   * (launch-on-demand network sockets whose descriptors the job collects
+   * at check-in) and LaunchEvents (higher-level event streams such as
+   * IOKit device matching). Values are validated as plist values at
+   * build(), and keys the package manages cannot be overridden here.
+   */
   extra(dictionary: PlistDictionary): LaunchAgentBuilder<S> {
     return this.#derive<S>({ extra: Object.freeze({ ...dictionary }) });
   }
@@ -406,6 +678,18 @@ export class LaunchAgentBuilder<
    * Assemble the definition and delegate every check to `validateLaunchAgent`,
    * throwing `LaunchAgentValidationError` with all issues on failure. Only
    * callable once `program()` or `programArguments()` has been provided.
+   *
+   * @example Every problem is reported in one throw
+   * ```ts
+   * import { assertStringIncludes, assertThrows } from "@std/assert";
+   *
+   * const error = assertThrows(
+   *   () => launchAgent("dev.example.bad").program("relative/path").daily(26).build(),
+   *   Error,
+   * );
+   * assertStringIncludes(error.message, "program: must be an absolute path");
+   * assertStringIncludes(error.message, "startCalendarInterval.hour");
+   * ```
    */
   build(this: LaunchAgentBuilder<"has-program">): LaunchAgentConfig {
     const config: unknown = { ...this.#draft };
@@ -414,7 +698,24 @@ export class LaunchAgentBuilder<
   }
 }
 
-/** Start a fluent LaunchAgent definition for the given label. */
+/**
+ * Start a fluent LaunchAgent definition for the given label. The finished
+ * definition renders to `~/Library/LaunchAgents/<label>.plist` and loads
+ * into the user's `gui/<uid>` domain.
+ *
+ * @example A polling agent, from label to validated definition
+ * ```ts
+ * import { assertEquals } from "@std/assert";
+ *
+ * const agent = launchAgent("dev.example.poller")
+ *   .programArguments(["/opt/homebrew/bin/poll", "--once"])
+ *   .every(300)
+ *   .logsTo("/Users/me/Library/Logs/poller.log")
+ *   .build();
+ * assertEquals(agent.startInterval, 300);
+ * assertEquals(agent.standardErrorPath, "/Users/me/Library/Logs/poller.log");
+ * ```
+ */
 export function launchAgent(label: string): LaunchAgentBuilder<"needs-program"> {
   return construct({ label }) as LaunchAgentBuilder<"needs-program">;
 }

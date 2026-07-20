@@ -1,3 +1,26 @@
+/**
+ * Typed definitions, validation, deterministic plist rendering, and launchctl
+ * management for per-user macOS LaunchAgents.
+ *
+ * Defining and rendering are pure and need no permissions; only the
+ * {@linkcode LaunchAgents} manager touches the filesystem and launchctl.
+ *
+ * @example Define an agent fluently and render its plist
+ * ```ts
+ * import { assertStringIncludes } from "@std/assert";
+ *
+ * const agent = launchAgent("dev.example.tidy")
+ *   .programArguments(["/usr/bin/find", "/Users/me/Downloads", "-mtime", "+30", "-delete"])
+ *   .daily(3, 15)
+ *   .build();
+ *
+ * const xml = renderLaunchAgent(agent);
+ * assertStringIncludes(xml, "<string>dev.example.tidy</string>");
+ * assertStringIncludes(xml, "<key>StartCalendarInterval</key>");
+ * ```
+ *
+ * @module
+ */
 export {
   defineLaunchAgent,
   renderLaunchAgent,

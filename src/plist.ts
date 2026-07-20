@@ -386,6 +386,15 @@ function validatePlistValue(
 /**
  * Validate an unknown value as a LaunchAgent definition, throwing one error
  * containing all discovered issues. Narrows the value on success.
+ *
+ * @example Narrow untrusted input, such as parsed JSON
+ * ```ts
+ * import { assertEquals } from "@std/assert";
+ *
+ * const parsed: unknown = JSON.parse('{"label":"dev.example.json","program":"/usr/bin/true"}');
+ * validateLaunchAgent(parsed); // throws LaunchAgentValidationError on failure
+ * assertEquals(parsed.label, "dev.example.json"); // parsed is now a LaunchAgentConfig
+ * ```
  */
 export function validateLaunchAgent(value: unknown): asserts value is LaunchAgentConfig {
   const issues: ValidationIssue[] = [];
@@ -558,7 +567,23 @@ export function validateLaunchAgent(value: unknown): asserts value is LaunchAgen
   if (issues.length > 0) throw new LaunchAgentValidationError(issues);
 }
 
-/** Type-friendly identity helper that validates definitions at startup. */
+/**
+ * Type-friendly identity helper that validates definitions at startup.
+ *
+ * @example Define a scheduled backup agent
+ * ```ts
+ * import { assertEquals } from "@std/assert";
+ *
+ * const agent = defineLaunchAgent({
+ *   label: "dev.example.backup",
+ *   program: "/usr/bin/rsync",
+ *   programArguments: ["/usr/bin/rsync", "-a", "/Users/me/Documents/", "/Volumes/Backup/"],
+ *   startCalendarInterval: { hour: 2, minute: 30 },
+ *   processType: "Background",
+ * });
+ * assertEquals(agent.label, "dev.example.backup");
+ * ```
+ */
 export function defineLaunchAgent<const T extends LaunchAgentConfig>(config: T): T {
   validateLaunchAgent(config);
   return config;
@@ -610,7 +635,25 @@ function machServicesToPlist(
   return output;
 }
 
-/** Convert an idiomatic TypeScript definition to launchd's key names. */
+/**
+ * Convert an idiomatic TypeScript definition to launchd's key names.
+ *
+ * @example camelCase fields become launchd's capitalized plist keys
+ * ```ts
+ * import { assertEquals } from "@std/assert";
+ *
+ * const plist = toLaunchdPlist({
+ *   label: "dev.example.tick",
+ *   programArguments: ["/usr/bin/say", "tick"],
+ *   startInterval: 300,
+ * });
+ * assertEquals(plist, {
+ *   Label: "dev.example.tick",
+ *   ProgramArguments: ["/usr/bin/say", "tick"],
+ *   StartInterval: 300,
+ * });
+ * ```
+ */
 export function toLaunchdPlist(config: LaunchAgentConfig): PlistDictionary {
   validateLaunchAgent(config);
   const output: Record<string, PlistValue> = { Label: config.label };
@@ -712,7 +755,22 @@ function encodeValue(value: PlistValue, depth: number): string[] {
   ];
 }
 
-/** Render a complete, deterministic XML property list. */
+/**
+ * Render a complete, deterministic XML property list.
+ *
+ * @example Render a minimal agent
+ * ```ts
+ * import { assertStringIncludes } from "@std/assert";
+ *
+ * const xml = renderLaunchAgent({
+ *   label: "dev.example.hello",
+ *   program: "/opt/homebrew/bin/hello",
+ *   runAtLoad: true,
+ * });
+ * assertStringIncludes(xml, '<?xml version="1.0" encoding="UTF-8"?>');
+ * assertStringIncludes(xml, "<key>RunAtLoad</key>\n    <true/>");
+ * ```
+ */
 export function renderLaunchAgent(config: LaunchAgentConfig): string {
   const dictionary = toLaunchdPlist(config);
   return [

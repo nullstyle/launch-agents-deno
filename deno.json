@@ -2,12 +2,13 @@
   "name": "@nullstyle/launch-agents",
   "exports": "./mod.ts",
   "tasks": {
-    "check": "deno check mod.ts tests/*.ts",
+    "check": "deno check --doc mod.ts src/*.ts tests/*.ts && deno check --doc-only README.md",
     "coverage": "deno test --allow-read=tests --allow-write=tests --coverage=coverage && deno coverage coverage",
     "fmt": "deno fmt",
     "fmt:check": "deno fmt --check",
     "lint": "deno lint",
-    "test": "deno test --allow-read=tests --allow-write=tests"
+    "test": "deno test --allow-read=tests --allow-write=tests",
+    "test:doc": "deno test --doc --allow-read=$TMPDIR --allow-write=$TMPDIR mod.ts src/"
   },
   "exclude": ["coverage", "tests/.tmp"],
   "fmt": {

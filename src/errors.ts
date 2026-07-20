@@ -1,6 +1,23 @@
 import type { LaunchctlResult, ValidationIssue } from "./types.ts";
 
-/** Thrown when a LaunchAgent definition violates one or more constraints. */
+/**
+ * Thrown when a LaunchAgent definition violates one or more constraints.
+ *
+ * All problems are collected before throwing, so `issues` lists every
+ * violation at once rather than only the first.
+ *
+ * @example Inspect the issues of a rejected definition
+ * ```ts
+ * import { assertEquals, assertThrows } from "@std/assert";
+ * import { validateLaunchAgent } from "./plist.ts";
+ *
+ * const error = assertThrows(
+ *   () => validateLaunchAgent({ label: "bad label", program: "relative" }),
+ *   LaunchAgentValidationError,
+ * );
+ * assertEquals(error.issues.map((issue) => issue.path).sort(), ["label", "program"]);
+ * ```
+ */
 export class LaunchAgentValidationError extends Error {
   /** Every validation problem found in the definition. */
   readonly issues: readonly ValidationIssue[];

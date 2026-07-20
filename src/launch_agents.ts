@@ -72,6 +72,31 @@ function isNotFound(error: unknown): boolean {
 /**
  * Manages per-user plist files and services in a launchd GUI or user domain.
  * No method invokes a shell; every launchctl argument is passed literally.
+ *
+ * The `runner` option is the only process boundary: injecting one replaces
+ * every launchctl invocation, which keeps these examples deterministic and
+ * shows the exact argv each method produces.
+ *
+ * @example Drive the manager through an injected runner, without launchctl
+ * ```ts
+ * import { assertEquals } from "@std/assert";
+ *
+ * const calls: string[][] = [];
+ * const runner = {
+ *   run: (_command: string, args: readonly string[]) => {
+ *     calls.push([...args]);
+ *     return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+ *   },
+ * };
+ * const agents = new LaunchAgents({ directory: "/tmp/agents", uid: 501, runner });
+ *
+ * await agents.disable("dev.example.demo");
+ * await agents.enable("dev.example.demo");
+ * assertEquals(calls, [
+ *   ["disable", "gui/501/dev.example.demo"],
+ *   ["enable", "gui/501/dev.example.demo"],
+ * ]);
+ * ```
  */
 export class LaunchAgents {
   /** Absolute directory containing managed plist files. */
@@ -86,7 +111,22 @@ export class LaunchAgents {
   readonly timeoutMillis: number | undefined;
   readonly #runner: CommandRunner;
 
-  /** Create a manager, defaulting to the current user's GUI domain. */
+  /**
+   * Create a manager, defaulting to the current user's GUI domain.
+   *
+   * @example Explicit options need no environment, uid probe, or filesystem
+   * ```ts
+   * import { assertEquals } from "@std/assert";
+   *
+   * const agents = new LaunchAgents({
+   *   directory: "/tmp/agents",
+   *   uid: 501,
+   *   domain: "user",
+   * });
+   * assertEquals(agents.domainTarget, "user/501");
+   * assertEquals(agents.agentPath("dev.example.demo"), "/tmp/agents/dev.example.demo.plist");
+   * ```
+   */
   constructor(options: LaunchAgentsOptions = {}) {
     this.directory = (options.directory ?? defaultDirectory()).replace(/\/+$/, "");
     assertAbsoluteDirectory(this.directory);
@@ -153,6 +193,21 @@ export class LaunchAgents {
    * True when launchctl can resolve this exact service target. Throws
    * `LaunchctlError` when launchctl fails for a reason other than the
    * service or domain not being found, such as a permission problem.
+   *
+   * @example Exit code 113 means not found, not failure
+   * ```ts
+   * import { assertEquals } from "@std/assert";
+   *
+   * const results = [
+   *   { code: 0, stdout: "state = running", stderr: "" },
+   *   { code: 113, stdout: "", stderr: "Could not find service" },
+   * ];
+   * const runner = { run: () => Promise.resolve(results.shift()!) };
+   * const agents = new LaunchAgents({ directory: "/tmp/agents", uid: 501, runner });
+   *
+   * assertEquals(await agents.isLoaded("dev.example.demo"), true);
+   * assertEquals(await agents.isLoaded("dev.example.demo"), false);
+   * ```
    */
   async isLoaded(label: string): Promise<boolean> {
     const result = await this.#run(["print", this.serviceTarget(label)]);
@@ -190,7 +245,34 @@ export class LaunchAgents {
     await this.#runChecked(["disable", this.serviceTarget(label)]);
   }
 
-  /** Start a loaded service immediately and return its PID. */
+  /**
+   * Start a loaded service immediately and return its PID.
+   *
+   * @example Start, then stop with the default SIGTERM
+   * ```ts
+   * import { assertEquals } from "@std/assert";
+   *
+   * const results = [
+   *   { code: 0, stdout: "4242\n", stderr: "" }, // kickstart -p prints the PID
+   *   { code: 0, stdout: "", stderr: "" }, // kill
+   * ];
+   * const calls: string[][] = [];
+   * const runner = {
+   *   run: (_command: string, args: readonly string[]) => {
+   *     calls.push([...args]);
+   *     return Promise.resolve(results.shift()!);
+   *   },
+   * };
+   * const agents = new LaunchAgents({ directory: "/tmp/agents", uid: 501, runner });
+   *
+   * assertEquals(await agents.start("dev.example.demo"), 4242);
+   * await agents.stop("dev.example.demo");
+   * assertEquals(calls, [
+   *   ["kickstart", "-p", "gui/501/dev.example.demo"],
+   *   ["kill", "SIGTERM", "gui/501/dev.example.demo"],
+   * ]);
+   * ```
+   */
   async start(label: string): Promise<number> {
     return await this.#kickstart(label, false);
   }
@@ -268,7 +350,36 @@ export class LaunchAgents {
     }
   }
 
-  /** Atomically write a plist without invoking launchctl. */
+  /**
+   * Atomically write a plist without invoking launchctl.
+   *
+   * @example Rewriting identical contents is a no-op; different contents are protected
+   * ```ts
+   * import { assertEquals, assertRejects } from "@std/assert";
+   * import { LaunchAgentFileExistsError } from "./errors.ts";
+   *
+   * const directory = await Deno.makeTempDir();
+   * const agents = new LaunchAgents({ directory, uid: 501 });
+   * const config = { label: "dev.example.demo", program: "/usr/bin/true" };
+   *
+   * const first = await agents.write(config);
+   * assertEquals(first, {
+   *   path: `${directory}/dev.example.demo.plist`,
+   *   created: true,
+   *   changed: true,
+   * });
+   * const second = await agents.write(config);
+   * assertEquals(second, { path: first.path, created: false, changed: false });
+   *
+   * // A different definition is refused without { overwrite: true }.
+   * await assertRejects(
+   *   () => agents.write({ ...config, program: "/usr/bin/false" }),
+   *   LaunchAgentFileExistsError,
+   * );
+   *
+   * await Deno.remove(directory, { recursive: true });
+   * ```
+   */
   async write(config: LaunchAgentConfig, options: WriteOptions = {}): Promise<WriteResult> {
     const contents = renderLaunchAgent(config);
     const path = this.agentPath(config.label);
@@ -299,6 +410,35 @@ export class LaunchAgents {
    * transaction begins (the initial read and loaded-state probe, or an
    * overwrite refusal) are thrown as-is; failures after it begins are wrapped
    * in `LaunchAgentOperationError`.
+   *
+   * @example A first install probes the service, writes, and bootstraps
+   * ```ts
+   * import { assertEquals } from "@std/assert";
+   *
+   * const results = [
+   *   { code: 113, stdout: "", stderr: "Could not find service" }, // isLoaded probe
+   *   { code: 0, stdout: "", stderr: "" }, // bootstrap
+   * ];
+   * const calls: string[][] = [];
+   * const runner = {
+   *   run: (_command: string, args: readonly string[]) => {
+   *     calls.push([...args]);
+   *     return Promise.resolve(results.shift()!);
+   *   },
+   * };
+   * const directory = await Deno.makeTempDir();
+   * const agents = new LaunchAgents({ directory, uid: 501, runner });
+   *
+   * const result = await agents.install({ label: "dev.example.demo", program: "/usr/bin/true" });
+   * assertEquals(result.created, true);
+   * assertEquals(result.loaded, true);
+   * assertEquals(calls, [
+   *   ["print", "gui/501/dev.example.demo"],
+   *   ["bootstrap", "gui/501", `${directory}/dev.example.demo.plist`],
+   * ]);
+   *
+   * await Deno.remove(directory, { recursive: true });
+   * ```
    */
   async install(
     config: LaunchAgentConfig,
@@ -386,6 +526,29 @@ export class LaunchAgents {
    * which otherwise outlives the plist and blocks a future install of the
    * same label. A missing plist with `ignoreMissing: false` throws
    * `Deno.errors.NotFound`; other pre-flight failures are thrown as-is.
+   *
+   * @example Boot out a loaded agent and delete its plist
+   * ```ts
+   * import { assertEquals } from "@std/assert";
+   *
+   * const results = [
+   *   { code: 0, stdout: "state = running", stderr: "" }, // print: currently loaded
+   *   { code: 0, stdout: "", stderr: "" }, // bootout
+   * ];
+   * const runner = { run: () => Promise.resolve(results.shift()!) };
+   * const directory = await Deno.makeTempDir();
+   * const agents = new LaunchAgents({ directory, uid: 501, runner });
+   * await agents.write({ label: "dev.example.demo", program: "/usr/bin/true" });
+   *
+   * const result = await agents.uninstall("dev.example.demo");
+   * assertEquals(result, {
+   *   path: `${directory}/dev.example.demo.plist`,
+   *   wasLoaded: true,
+   *   removed: true,
+   * });
+   *
+   * await Deno.remove(directory, { recursive: true });
+   * ```
    */
   async uninstall(label: string, options: UninstallOptions = {}): Promise<UninstallResult> {
     const path = this.agentPath(label);
